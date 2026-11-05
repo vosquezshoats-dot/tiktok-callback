@@ -10,6 +10,130 @@ const TIKTOK_TOKEN_URL =
 
 const encoder = new TextEncoder();
 
+// Conservative budgets for Workers Free. All cursors and pending batches live
+// in the existing state_json column; no D1 schema changes are required.
+const SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const SYNC_STATE_ID = 1;
+const SYNC_LEASE_MS = 4 * 60 * 1000;
+const SYNC_MAX_EXTERNAL_REQUESTS = 12;
+const SYNC_MAX_PAGES = 3;
+const SYNC_MAX_WALL_MS = 18000;
+const SYNC_RETRY_BASE_MS = 5 * 60 * 1000;
+
+async function loadSyncRow(env) {
+  return env.DB.prepare("SELECT state_json, updated_at FROM tiktok_sync_state WHERE id=?")
+    .bind(SYNC_STATE_ID).first();
+}
+async function readSyncState(env) {
+  const row = await loadSyncRow(env);
+  if (!row?.state_json) return null;
+  try { return JSON.parse(row.state_json); } catch { return null; }
+}
+async function saveSyncState(env, state, expectedUpdatedAt) {
+  const now = new Date().toISOString();
+  // A monotonic state version makes each persisted checkpoint distinct even
+  // when several saves happen within the same millisecond.
+  state.state_version = (Number(state.state_version) || 0) + 1;
+  const json = JSON.stringify(state);
+  if (expectedUpdatedAt == null) {
+    const result = await env.DB.prepare(`INSERT OR IGNORE INTO tiktok_sync_state (id,state_json,updated_at) VALUES (?,?,?)`)
+      .bind(SYNC_STATE_ID,json,now).run();
+    return Boolean(result.meta?.changes);
+  }
+  // Compare the complete prior state payload. updated_at has millisecond
+  // precision and is not a safe CAS token for rapid consecutive writes.
+  const result = await env.DB.prepare(`UPDATE tiktok_sync_state SET state_json=?,updated_at=? WHERE id=? AND state_json=?`)
+    .bind(json,now,SYNC_STATE_ID,expectedUpdatedAt).run();
+  return Boolean(result.meta?.changes);
+}
+async function tiktokGet(url, token) {
+  const response = await fetch(url,{headers:{"Access-Token":token},signal:AbortSignal.timeout(12000)});
+  let result;
+  try { result=await response.json(); } catch { throw new Error(`TikTok invalid JSON (HTTP ${response.status})`); }
+  if (!response.ok || result.code!==0) {
+    const e=new Error(`TikTok API HTTP ${response.status}, code ${result.code??"unknown"}: ${result.message??"unknown"}`);
+    e.retryAfter=response.headers.get("Retry-After"); throw e;
+  }
+  return result;
+}
+function pageInfo(data) {
+  const p=data?.page_info;
+  if (!p || !Number.isInteger(Number(p.page)) || !Number.isInteger(Number(p.total_page)) || Number(p.total_page)<1) {
+    throw new Error("TikTok page_info missing or invalid; refusing to advance cursor");
+  }
+  return {page:Number(p.page),total:Number(p.total_page),count:Number(p.total_number??0)};
+}
+function newSyncState(previous, now) {
+  return {running:true,phase:"bc",started_at:new Date(now).toISOString(),cycle_due_at:new Date(now+SYNC_INTERVAL_MS).toISOString(),
+    completed_at:previous?.completed_at??null,heartbeat_at:new Date(now).toISOString(),lease_until:null,
+    bc_page:1,bc_ids:[],bc_total_pages:null,bc_index:0,account_page:1,account_total_pages:null,
+    pending_assets:null,batch_index:0,processed_bcs:0,processed_accounts:0,new_accounts:0,updated_accounts:0,
+    failed_pages:0,last_error:null,retry_at:null};
+}
+async function acquireSyncLease(env) {
+  const row=await loadSyncRow(env); const now=Date.now(); let state=null;
+  if(row?.state_json) { try { state=JSON.parse(row.state_json); } catch {} }
+  if(state?.retry_at && Date.parse(state.retry_at)>now) return null;
+  if(state?.running && Date.parse(state.lease_until||0)>now) return null;
+  if(!state?.running) {
+    if(state?.cycle_due_at && Date.parse(state.cycle_due_at)>now) return null;
+    state=newSyncState(state,now);
+  }
+  state.running=true; state.lease_until=new Date(now+SYNC_LEASE_MS).toISOString(); state.heartbeat_at=new Date(now).toISOString();
+  const ok=await saveSyncState(env,state,row?.state_json??null);
+  const saved=ok?await loadSyncRow(env):null;
+  return ok?{state,expectedStateJson:saved?.state_json}:null;
+}
+async function runScheduledSync(env) {
+  let lease=await acquireSyncLease(env); if(!lease) return;
+  let {state,expectedStateJson}=lease;
+  const started=Date.now(), deadline=started+SYNC_MAX_WALL_MS; let requests=0,pages=0;
+  const persist=async()=>{state.heartbeat_at=new Date().toISOString();state.lease_until=new Date(Date.now()+SYNC_LEASE_MS).toISOString();
+    if(!expectedStateJson || !await saveSyncState(env,state,expectedStateJson)) throw new Error("Sync lease lost to another Cron invocation");
+    expectedStateJson=(await loadSyncRow(env))?.state_json;};
+  try {
+    const token=await getAccessToken(env);
+    while(requests<SYNC_MAX_EXTERNAL_REQUESTS && pages<SYNC_MAX_PAGES && Date.now()<deadline) {
+      if(state.phase==="bc") {
+        const u=new URL("https://business-api.tiktok.com/open_api/v1.3/bc/get/");u.searchParams.set("page",String(state.bc_page));u.searchParams.set("page_size","50");
+        const r=await tiktokGet(u,token);requests++;const list=r.data?.list;
+        if(!Array.isArray(list)) throw new Error("BC response list missing; cursor retained");
+        const pi=pageInfo(r.data);
+        for(const x of list){const b=x.bc_info??x;if(!b.bc_id||!b.name)continue;const id=String(b.bc_id);
+          await env.DB.prepare(`INSERT INTO business_centers (business_center_id,name,updated_at) VALUES (?,?,?) ON CONFLICT(business_center_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at`).bind(id,b.name,new Date().toISOString()).run();
+          if(!state.bc_ids.includes(id))state.bc_ids.push(id);}
+        state.bc_total_pages=pi.total;if(pi.page<pi.total)state.bc_page++;else{state.phase="accounts";state.bc_index=0;}pages++;
+      } else if(state.phase==="accounts") {
+        if(state.bc_index>=state.bc_ids.length){state.running=false;state.phase="complete";state.completed_at=new Date().toISOString();state.cycle_due_at=new Date(Date.now()+SYNC_INTERVAL_MS).toISOString();state.lease_until=null;state.retry_at=null;await persist();return;}
+        const bc=state.bc_ids[state.bc_index];state.current_bc=bc;state.current_page=state.account_page;
+        if(!state.pending_assets){const u=new URL("https://business-api.tiktok.com/open_api/v1.3/bc/asset/get/");u.searchParams.set("bc_id",bc);u.searchParams.set("asset_type","ADVERTISER");u.searchParams.set("page",String(state.account_page));u.searchParams.set("page_size","50");
+          const r=await tiktokGet(u,token);requests++;if(!Array.isArray(r.data?.list))throw new Error("Advertiser asset list missing; cursor retained");const pi=pageInfo(r.data);state.pending_assets=r.data.list;state.account_total_pages=pi.total;state.batch_index=0;pages++;await persist();}
+        const assets=state.pending_assets, batches=[];for(let i=0;i<assets.length;i+=20)batches.push(assets.slice(i,i+20));
+        if(state.batch_index<batches.length){if(requests>=SYNC_MAX_EXTERNAL_REQUESTS)break;
+          const batch=batches[state.batch_index],ids=batch.map(a=>String(a.asset_id)).filter(Boolean);if(!ids.length)throw new Error("Asset batch contains no advertiser IDs");
+          const u=new URL("https://business-api.tiktok.com/open_api/v1.3/advertiser/info/");u.searchParams.set("advertiser_ids",JSON.stringify(ids));const ir=await tiktokGet(u,token);requests++;
+          if(!Array.isArray(ir.data?.list))throw new Error("Advertiser info list missing; batch retained");const found=new Map(ir.data.list.map(a=>[String(a.advertiser_id),a]));
+          for(const asset of batch){const id=String(asset.asset_id),info=found.get(id);if(!info?.name||!info?.currency)throw new Error(`Details missing for advertiser ${id}; batch retained`);
+            const old=await env.DB.prepare("SELECT 1 AS yes FROM advertiser_accounts WHERE business_center_id=? AND advertiser_id=?").bind(bc,id).first();
+            await env.DB.prepare(`INSERT INTO advertiser_accounts (business_center_id,advertiser_id,advertiser_name,currency,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(business_center_id,advertiser_id) DO UPDATE SET advertiser_name=excluded.advertiser_name,currency=excluded.currency,updated_at=excluded.updated_at`).bind(bc,id,info.name,info.currency,new Date().toISOString()).run();
+            if(old)state.updated_accounts++;else state.new_accounts++;state.processed_accounts++;}
+          state.batch_index++;await persist();continue;
+        }
+        state.pending_assets=null;state.batch_index=0;
+        if(state.account_page<state.account_total_pages)state.account_page++;else{state.bc_index++;state.processed_bcs++;state.account_page=1;state.account_total_pages=null;}pages++;
+      } else throw new Error(`Unknown sync phase: ${state.phase}`);
+      await persist();
+    }
+  } catch(error) {
+    state.failed_pages++;state.last_error=String(error.message||"Sync failed").slice(0,500);
+    const retryMs=error.retryAfter?Math.max(60000,Number(error.retryAfter)*1000):Math.min(60*60*1000,SYNC_RETRY_BASE_MS*Math.pow(2,Math.min(state.failed_pages-1,4)));
+    state.retry_at=new Date(Date.now()+retryMs).toISOString();state.running=true;state.lease_until=null;
+    state.heartbeat_at=new Date().toISOString();
+    if(expectedStateJson) await saveSyncState(env,state,expectedStateJson);
+    console.error("Scheduled TikTok sync paused for retry:",state.last_error);
+  }
+}
+
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -266,8 +390,30 @@ async function handleCallback(request, env) {
 }
 
 export default {
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(runScheduledSync(env));
+  },
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    if (url.pathname === "/api/tiktok/sync-status") {
+      const providedKey = request.headers.get("X-Dashboard-Key");
+      if (!env.DASHBOARD_API_KEY || providedKey !== env.DASHBOARD_API_KEY) return new Response("Unauthorized", { status: 401 });
+      try {
+        const state = await readSyncState(env);
+        return jsonResponse({
+          success: true, running: Boolean(state?.running), started_at: state?.started_at ?? null,
+          completed_at: state?.completed_at ?? null, current_bc: state?.current_bc ?? null,
+          current_page: state?.current_page ?? null, processed_bcs: state?.processed_bcs ?? 0,
+          processed_accounts: state?.processed_accounts ?? 0, new_accounts: state?.new_accounts ?? 0,
+          updated_accounts: state?.updated_accounts ?? 0, failed_pages: state?.failed_pages ?? 0,
+          last_error: state?.last_error ?? null
+        });
+      } catch (error) {
+        console.error("Sync status read failed:", error.message);
+        return jsonResponse({ success: false, error: "Sync status unavailable." }, 500);
+      }
+    }
 
     if (url.pathname === "/") {
       return new Response(
