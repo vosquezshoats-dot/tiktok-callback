@@ -781,6 +781,8 @@ if (url.pathname === "/api/tiktok/daily-report") {
             if (
               !Array.isArray(data?.list) ||
               !info ||
+              info.page == null ||
+              info.total_page == null ||
               !Number.isInteger(Number(info.page)) ||
               Number(info.page) !== page ||
               !Number.isInteger(Number(info.total_page)) ||
