@@ -658,7 +658,88 @@ export default {
       }
     }
   
-if (url.pathname === "/api/tiktok/sync-business-center-accounts") {
+if (url.pathname === "/api/tiktok/daily-report") {
+      const providedKey = request.headers.get("X-Dashboard-Key");
+      if (!env.DASHBOARD_API_KEY || providedKey !== env.DASHBOARD_API_KEY) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      const reportDate = url.searchParams.get("date");
+      const parsedDate = reportDate ? new Date(`${reportDate}T00:00:00.000Z`) : null;
+      if (
+        !reportDate ||
+        !/^\\d{4}-\\d{2}-\\d{2}$/.test(reportDate) ||
+        !Number.isFinite(parsedDate?.getTime()) ||
+        parsedDate.toISOString().slice(0, 10) !== reportDate
+      ) {
+        return Response.json({
+          success: false,
+          error: "Please provide a valid date in YYYY-MM-DD format."
+        }, { status: 400 });
+      }
+
+      try {
+        const result = await env.DB.prepare(`
+          SELECT
+            d.business_center_id,
+            COALESCE(MAX(bc.name), 'Business Center ' || d.business_center_id) AS business_center_name,
+            d.advertiser_id,
+            COALESCE(MAX(a.advertiser_name), 'Advertiser ' || d.advertiser_id) AS advertiser_name,
+            d.currency,
+            SUM(CAST(d.spend AS REAL)) AS spend
+          FROM daily_spend d
+          LEFT JOIN business_centers bc
+            ON bc.business_center_id = d.business_center_id
+          LEFT JOIN advertiser_accounts a
+            ON a.business_center_id = d.business_center_id
+            AND a.advertiser_id = d.advertiser_id
+          WHERE d.report_date = ?
+          GROUP BY d.business_center_id, d.advertiser_id, d.currency
+          ORDER BY business_center_name COLLATE NOCASE, d.business_center_id, spend DESC, d.advertiser_id
+        `).bind(reportDate).all();
+
+        const centers = new Map();
+        const roundMoney = value => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+        for (const row of result.results || []) {
+          const bcId = String(row.business_center_id);
+          if (!centers.has(bcId)) {
+            centers.set(bcId, {
+              business_center_id: bcId,
+              business_center_name: row.business_center_name,
+              currency_totals: {},
+              accounts: []
+            });
+          }
+          const center = centers.get(bcId);
+          const currency = String(row.currency);
+          const spend = roundMoney(row.spend);
+          center.currency_totals[currency] = roundMoney((center.currency_totals[currency] || 0) + spend);
+          center.accounts.push({
+            advertiser_id: String(row.advertiser_id),
+            advertiser_name: row.advertiser_name,
+            currency,
+            spend
+          });
+        }
+
+        const businessCenters = [...centers.values()];
+        return Response.json({
+          success: true,
+          date: reportDate,
+          business_center_count: businessCenters.length,
+          account_rows: businessCenters.reduce((count, bc) => count + bc.accounts.length, 0),
+          data: { business_centers: businessCenters }
+        });
+      } catch (error) {
+        console.error("Daily BC report query failed:", error.message);
+        return Response.json({
+          success: false,
+          error: "Daily BC report query failed."
+        }, { status: 500 });
+      }
+    }
+
+    if (url.pathname === "/api/tiktok/sync-business-center-accounts") {
   const providedKey = request.headers.get("X-Dashboard-Key");
 
   if (
