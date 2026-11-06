@@ -495,7 +495,7 @@ export default {
         // Use the complete, already-synchronized D1 history instead of the
         // first live TikTok page. This is read-only and preserves old BC links.
         const result = await env.DB.prepare(
-          "SELECT business_center_id, name FROM business_centers ORDER BY name COLLATE NOCASE, business_center_id"
+          "SELECT ids.business_center_id, COALESCE(MAX(bc.name), 'Business Center ' || ids.business_center_id) AS name FROM (SELECT business_center_id FROM business_centers UNION SELECT business_center_id FROM advertiser_accounts) ids LEFT JOIN business_centers bc ON bc.business_center_id = ids.business_center_id GROUP BY ids.business_center_id ORDER BY name COLLATE NOCASE, ids.business_center_id"
         ).all();
         const list = (result.results || []).map(row => ({
           bc_info: { bc_id: String(row.business_center_id), name: row.name }
