@@ -665,10 +665,12 @@ if (url.pathname === "/api/tiktok/daily-report") {
       }
 
       const reportDate = url.searchParams.get("date");
-      const parsedDate = reportDate ? new Date(`${reportDate}T00:00:00.000Z`) : null;
+      const parsedDate = reportDate ? new Date(reportDate + "T00:00:00.000Z") : null;
       if (
         !reportDate ||
-        !/^\d{4}-\d{2}-\d{2}$/.test(reportDate) ||
+        reportDate.length !== 10 ||
+        reportDate[4] !== "-" ||
+        reportDate[7] !== "-" ||
         !Number.isFinite(parsedDate?.getTime()) ||
         parsedDate.toISOString().slice(0, 10) !== reportDate
       ) {
@@ -679,50 +681,164 @@ if (url.pathname === "/api/tiktok/daily-report") {
       }
 
       try {
-        const result = await env.DB.prepare(`
-          SELECT
-            d.business_center_id,
-            COALESCE(MAX(bc.name), 'Business Center ' || d.business_center_id) AS business_center_name,
-            d.advertiser_id,
-            COALESCE(MAX(a.advertiser_name), 'Advertiser ' || d.advertiser_id) AS advertiser_name,
-            d.currency,
-            SUM(CAST(d.spend AS REAL)) AS spend
-          FROM daily_spend d
-          LEFT JOIN business_centers bc
-            ON bc.business_center_id = d.business_center_id
-          LEFT JOIN advertiser_accounts a
-            ON a.business_center_id = d.business_center_id
-            AND a.advertiser_id = d.advertiser_id
-          WHERE d.report_date = ?
-          GROUP BY d.business_center_id, d.advertiser_id, d.currency
-          ORDER BY business_center_name COLLATE NOCASE, d.business_center_id, spend DESC, d.advertiser_id
-        `).bind(reportDate).all();
+        // Load BC/account associations and names from existing D1 history.
+        // The same advertiser is intentionally kept under every associated BC.
+        const associationResult = await env.DB.prepare(
+          "SELECT ids.business_center_id, COALESCE(MAX(bc.name), 'Business Center ' || ids.business_center_id) AS business_center_name, aa.advertiser_id, MAX(aa.advertiser_name) AS advertiser_name, MAX(aa.currency) AS currency FROM (SELECT business_center_id FROM business_centers UNION SELECT business_center_id FROM advertiser_accounts) ids LEFT JOIN business_centers bc ON bc.business_center_id = ids.business_center_id LEFT JOIN advertiser_accounts aa ON aa.business_center_id = ids.business_center_id GROUP BY ids.business_center_id, aa.advertiser_id ORDER BY business_center_name COLLATE NOCASE, ids.business_center_id, advertiser_name COLLATE NOCASE, aa.advertiser_id"
+        ).all();
 
         const centers = new Map();
-        const roundMoney = value => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
-        for (const row of result.results || []) {
+        for (const row of associationResult.results || []) {
           const bcId = String(row.business_center_id);
           if (!centers.has(bcId)) {
             centers.set(bcId, {
               business_center_id: bcId,
               business_center_name: row.business_center_name,
               currency_totals: {},
-              accounts: []
+              accounts: [],
+              accountMap: new Map()
             });
           }
+          if (!row.advertiser_id) continue;
           const center = centers.get(bcId);
-          const currency = String(row.currency);
-          const spend = roundMoney(row.spend);
-          center.currency_totals[currency] = roundMoney((center.currency_totals[currency] || 0) + spend);
-          center.accounts.push({
+          const account = {
             advertiser_id: String(row.advertiser_id),
-            advertiser_name: row.advertiser_name,
-            currency,
-            spend
-          });
+            advertiser_name: row.advertiser_name || ("Advertiser " + row.advertiser_id),
+            currency: String(row.currency || "UNKNOWN"),
+            spend: 0
+          };
+          center.accountMap.set(account.advertiser_id, account);
+          center.accounts.push(account);
         }
 
-        const businessCenters = [...centers.values()];
+        const token = await getAccessToken(env);
+        const jobs = [];
+        for (const center of centers.values()) {
+          const accounts = [...center.accountMap.values()];
+          for (let i = 0; i < accounts.length; i += 20) {
+            jobs.push({ center, accounts: accounts.slice(i, i + 20) });
+          }
+        }
+        if (jobs.length > 100) {
+          return Response.json({
+            success: false,
+            error: "This report exceeds the safe request limit. Split the BC list before retrying."
+          }, { status: 413 });
+        }
+
+        let nextJob = 0;
+        let requestFailure = null;
+        const fetchBatch = async job => {
+          const ids = job.accounts.map(account => account.advertiser_id);
+          let page = 1;
+          let totalPages = 1;
+          do {
+            const response = await fetch(
+              "https://business-api.tiktok.com/open_api/v2.0/report/integrated/get/",
+              {
+                method: "POST",
+                headers: {
+                  "Access-Token": token,
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                  advertiser_ids: ids,
+                  dimensions: ["advertiser_id", "stat_time_day"],
+                  metrics: ["spend"],
+                  start_date: reportDate,
+                  end_date: reportDate,
+                  page,
+                  page_size: 1000,
+                  query_lifetime: false,
+                  query_in_utc0: false
+                }),
+                signal: AbortSignal.timeout(15000)
+              }
+            );
+            const rawBody = await response.text();
+            let result;
+            try {
+              result = JSON.parse(rawBody);
+            } catch {
+              const preview = rawBody.slice(0, 240).split(token).join("[redacted]");
+              throw new Error(
+                "TikTok report POST /open_api/v2.0/report/integrated/get/ returned non-JSON (HTTP " +
+                response.status + ", content-type " +
+                (response.headers.get("Content-Type") || "unknown") +
+                ", body " + JSON.stringify(preview) + ")"
+              );
+            }
+            if (!response.ok || result.code !== 0) {
+              throw new Error(
+                "TikTok report POST /open_api/v2.0/report/integrated/get/ failed (HTTP " +
+                response.status + ", code " + (result.code ?? "unknown") +
+                ", message " + String(result.message || "unknown").slice(0, 200) + ")"
+              );
+            }
+
+            const data = result.data;
+            const info = data?.page_info;
+            if (
+              !Array.isArray(data?.list) ||
+              !info ||
+              !Number.isInteger(Number(info.page)) ||
+              Number(info.page) !== page ||
+              !Number.isInteger(Number(info.total_page)) ||
+              Number(info.total_page) < 0
+            ) {
+              throw new Error(
+                "TikTok report page_info/list invalid for POST /open_api/v2.0/report/integrated/get/ (page " +
+                page + ")"
+              );
+            }
+            totalPages = Number(info.total_page);
+            if (totalPages === 0 && data.list.length !== 0) {
+              throw new Error("TikTok report returned rows while total_page was zero");
+            }
+
+            for (const item of data.list) {
+              const advertiserId = String(item.dimensions?.advertiser_id || "");
+              const rowDate = item.dimensions?.stat_time_day;
+              const spendValue = item.metrics?.spend;
+              const spend = Number(spendValue);
+              const account = job.center.accountMap.get(advertiserId);
+              if (!account || !ids.includes(advertiserId) || rowDate !== reportDate || !Number.isFinite(spend)) {
+                throw new Error("TikTok report row did not match the requested advertiser/date");
+              }
+              account.spend = Math.round((account.spend + spend + Number.EPSILON) * 100) / 100;
+            }
+            page++;
+          } while (page <= totalPages);
+        };
+
+        const workers = Array.from({ length: Math.min(4, jobs.length) }, async () => {
+          while (nextJob < jobs.length && !requestFailure) {
+            const job = jobs[nextJob++];
+            try {
+              await fetchBatch(job);
+            } catch (error) {
+              requestFailure = error;
+            }
+          }
+        });
+        await Promise.all(workers);
+        if (requestFailure) throw requestFailure;
+
+        const businessCenters = [...centers.values()].map(center => {
+          const currencyTotals = {};
+          for (const account of center.accounts) {
+            currencyTotals[account.currency] =
+              Math.round(((currencyTotals[account.currency] || 0) + account.spend + Number.EPSILON) * 100) / 100;
+          }
+          center.accounts.sort((a, b) => b.spend - a.spend || a.advertiser_name.localeCompare(b.advertiser_name));
+          return {
+            business_center_id: center.business_center_id,
+            business_center_name: center.business_center_name,
+            currency_totals: currencyTotals,
+            accounts: center.accounts
+          };
+        });
+
         return Response.json({
           success: true,
           date: reportDate,
@@ -731,11 +847,11 @@ if (url.pathname === "/api/tiktok/daily-report") {
           data: { business_centers: businessCenters }
         });
       } catch (error) {
-        console.error("Daily BC report query failed:", error.message);
+        console.error("Daily BC report failed:", error.message);
         return Response.json({
           success: false,
-          error: "Daily BC report query failed."
-        }, { status: 500 });
+          error: String(error.message || "Daily BC report failed.").slice(0, 500)
+        }, { status: 502 });
       }
     }
 
