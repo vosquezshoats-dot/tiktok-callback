@@ -486,45 +486,24 @@ export default {
         }, { status: 500 });
       }
     }
-        if (url.pathname === "/api/tiktok/business-centers") {
+    if (url.pathname === "/api/tiktok/business-centers") {
       const providedKey = request.headers.get("X-Dashboard-Key");
-
-      if (
-        !env.DASHBOARD_API_KEY ||
-        providedKey !== env.DASHBOARD_API_KEY
-      ) {
+      if (!env.DASHBOARD_API_KEY || providedKey !== env.DASHBOARD_API_KEY) {
         return new Response("Unauthorized", { status: 401 });
       }
-
       try {
-        const token = await getAccessToken(env);
-
-        const apiResponse = await fetch(
-          "https://business-api.tiktok.com/open_api/v1.3/bc/get/?page=1&page_size=10",
-          {
-            method: "GET",
-            headers: {
-              "Access-Token": token
-            }
-          }
-        );
-
-        const result = await apiResponse.json();
-
-        return Response.json({
-          success: apiResponse.ok && result.code === 0,
-          http_status: apiResponse.status,
-          tiktok_code: result.code ?? null,
-          message: result.message ?? null,
-          data: result.data ?? null
-        });
+        // Use the complete, already-synchronized D1 history instead of the
+        // first live TikTok page. This is read-only and preserves old BC links.
+        const result = await env.DB.prepare(
+          "SELECT ids.business_center_id, COALESCE(MAX(bc.name), 'Business Center ' || ids.business_center_id) AS name FROM (SELECT business_center_id FROM business_centers UNION SELECT business_center_id FROM advertiser_accounts) ids LEFT JOIN business_centers bc ON bc.business_center_id = ids.business_center_id GROUP BY ids.business_center_id ORDER BY name COLLATE NOCASE, ids.business_center_id"
+        ).all();
+        const list = (result.results || []).map(row => ({
+          bc_info: { bc_id: String(row.business_center_id), name: row.name }
+        }));
+        return jsonResponse({ success: true, count: list.length, source: "d1", data: { list } });
       } catch (error) {
-        console.error("Business Center query failed:", error.message);
-
-        return Response.json({
-          success: false,
-          error: "Business Center query failed."
-        }, { status: 500 });
+        console.error("Business Center history query failed:", error.message);
+        return jsonResponse({ success: false, error: "Business Center history query failed." }, 500);
       }
     }
       if (url.pathname === "/api/tiktok/sync-business-centers") {
@@ -862,60 +841,31 @@ if (url.pathname === "/api/tiktok/sync-business-center-accounts") {
  
 if (url.pathname === "/api/tiktok/business-center-accounts") {
   const providedKey = request.headers.get("X-Dashboard-Key");
-
-  if (
-    !env.DASHBOARD_API_KEY ||
-    providedKey !== env.DASHBOARD_API_KEY
-  ) {
+  if (!env.DASHBOARD_API_KEY || providedKey !== env.DASHBOARD_API_KEY) {
     return new Response("Unauthorized", { status: 401 });
   }
-
   const businessCenterId = url.searchParams.get("bc_id");
-
   if (!businessCenterId) {
-    return Response.json({
-      success: false,
-      error: "Please provide bc_id."
-    }, { status: 400 });
+    return jsonResponse({ success: false, error: "Please provide bc_id." }, 400);
   }
-
   try {
-    const token = await getAccessToken(env);
-
-    const apiUrl = new URL(
-      "https://business-api.tiktok.com/open_api/v1.3/bc/asset/get/"
-    );
-    apiUrl.searchParams.set("bc_id", businessCenterId);
-    apiUrl.searchParams.set("asset_type", "ADVERTISER");
-
-    const page = url.searchParams.get("page") || "1";
-    apiUrl.searchParams.set("page", page);
-
-    apiUrl.searchParams.set("page_size", "50");
-
-    const apiResponse = await fetch(apiUrl.toString(), {
-      method: "GET",
-      headers: {
-        "Access-Token": token
-      }
-    });
-
-    const result = await apiResponse.json();
-
-    return Response.json({
-      success: apiResponse.ok && result.code === 0,
-      http_status: apiResponse.status,
-      tiktok_code: result.code ?? null,
-      message: result.message ?? null,
-      data: result.data ?? null
+    // Return every stored association, including historical relationships.
+    // The dashboard must not silently truncate at TikTok's first 50 assets.
+    const result = await env.DB.prepare(
+      "SELECT advertiser_id, advertiser_name, currency FROM advertiser_accounts WHERE business_center_id = ? ORDER BY advertiser_name COLLATE NOCASE, advertiser_id"
+    ).bind(businessCenterId).all();
+    const list = (result.results || []).map(row => ({
+      asset_id: String(row.advertiser_id),
+      asset_name: row.advertiser_name,
+      currency: row.currency
+    }));
+    return jsonResponse({
+      success: true, count: list.length, source: "d1",
+      data: { list, page_info: { page: 1, total_page: 1, total_number: list.length } }
     });
   } catch (error) {
-    console.error("Advertiser account query failed:", error.message);
-
-    return Response.json({
-      success: false,
-      error: "Advertiser account query failed."
-    }, { status: 500 });
+    console.error("Advertiser account history query failed:", error.message);
+    return jsonResponse({ success: false, error: "Advertiser account history query failed." }, 500);
   }
 }
 
