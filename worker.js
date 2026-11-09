@@ -199,7 +199,8 @@ async function runScheduledSync(env) {
           await persist();continue;
         }
         const batch=batches[state.spend_batch_index];
-        if(requests>=SYNC_MAX_EXTERNAL_REQUESTS || pages>=SYNC_MAX_PAGES) break;
+        // Reserve room for a GET-to-POST fallback if TikTok returns HTTP 405.
+        if(requests>=SYNC_MAX_EXTERNAL_REQUESTS-1 || pages>=SYNC_MAX_PAGES) break;
         const pageResult=await fetchScheduledSpendPage(token,batch.map(a=>a.advertiser_id),state.spend_date,state.spend_page);
         requests+=pageResult.attempts;pages++;
         const allowed=new Set(batch.map(a=>a.advertiser_id));
