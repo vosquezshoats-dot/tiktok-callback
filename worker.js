@@ -665,6 +665,7 @@ if (url.pathname === "/api/tiktok/daily-report") {
       }
 
       const reportDate = url.searchParams.get("date");
+      const businessCenterId = url.searchParams.get("bc_id");
       const parsedDate = reportDate ? new Date(reportDate + "T00:00:00.000Z") : null;
       if (
         !reportDate ||
@@ -684,8 +685,8 @@ if (url.pathname === "/api/tiktok/daily-report") {
         // Load BC/account associations and names from existing D1 history.
         // The same advertiser is intentionally kept under every associated BC.
         const associationResult = await env.DB.prepare(
-          "SELECT ids.business_center_id, COALESCE(MAX(bc.name), 'Business Center ' || ids.business_center_id) AS business_center_name, aa.advertiser_id, MAX(aa.advertiser_name) AS advertiser_name, MAX(aa.currency) AS currency FROM (SELECT business_center_id FROM business_centers UNION SELECT business_center_id FROM advertiser_accounts) ids LEFT JOIN business_centers bc ON bc.business_center_id = ids.business_center_id LEFT JOIN advertiser_accounts aa ON aa.business_center_id = ids.business_center_id GROUP BY ids.business_center_id, aa.advertiser_id ORDER BY business_center_name COLLATE NOCASE, ids.business_center_id, advertiser_name COLLATE NOCASE, aa.advertiser_id"
-        ).all();
+          "SELECT ids.business_center_id, COALESCE(MAX(bc.name), 'Business Center ' || ids.business_center_id) AS business_center_name, aa.advertiser_id, MAX(aa.advertiser_name) AS advertiser_name, MAX(aa.currency) AS currency FROM (SELECT business_center_id FROM business_centers UNION SELECT business_center_id FROM advertiser_accounts) ids LEFT JOIN business_centers bc ON bc.business_center_id = ids.business_center_id LEFT JOIN advertiser_accounts aa ON aa.business_center_id = ids.business_center_id WHERE ids.business_center_id = ? GROUP BY ids.business_center_id, aa.advertiser_id ORDER BY business_center_name COLLATE NOCASE, ids.business_center_id, advertiser_name COLLATE NOCASE, aa.advertiser_id"
+        ).bind(businessCenterId).all();
 
         const centers = new Map();
         for (const row of associationResult.results || []) {
