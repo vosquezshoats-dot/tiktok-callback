@@ -669,6 +669,7 @@ if (url.pathname === "/api/tiktok/daily-report") {
       const parsedDate = reportDate ? new Date(reportDate + "T00:00:00.000Z") : null;
       if (
         !reportDate ||
+        !businessCenterId ||
         reportDate.length !== 10 ||
         reportDate[4] !== "-" ||
         reportDate[7] !== "-" ||
