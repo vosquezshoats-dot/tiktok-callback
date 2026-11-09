@@ -526,8 +526,9 @@ export default {
           completed_at: state?.completed_at ?? null, current_bc: state?.current_bc ?? null,
           current_page: state?.current_page ?? null, processed_bcs: state?.processed_bcs ?? 0,
           processed_accounts: state?.processed_accounts ?? 0, new_accounts: state?.new_accounts ?? 0,
-          updated_accounts: state?.updated_accounts ?? 0, failed_pages: state?.failed_pages ?? 0,
-          last_error: state?.last_error ?? null
+          updated_accounts: state?.updated_accounts ?? 0, phase: state?.phase ?? null,
+          spend_date: state?.spend_date ?? null, spend_rows_written: state?.spend_rows_written ?? 0,
+          failed_pages: state?.failed_pages ?? 0, last_error: state?.last_error ?? null
         });
       } catch (error) {
         console.error("Sync status read failed:", error.message);
