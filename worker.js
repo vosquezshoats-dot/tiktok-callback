@@ -749,7 +749,8 @@ if (url.pathname === "/api/tiktok/daily-report") {
               end_date: reportDate,
               page,
               page_size: 1000,
-              query_lifetime: false,
+              // query_lifetime is listed as deprecated in the v2.0 migration notes;
+              // omit it and let the explicit start_date/end_date define the report.
               query_in_utc0: false
             };
             for (const [key, value] of Object.entries(reportParams)) {
@@ -786,7 +787,7 @@ if (url.pathname === "/api/tiktok/daily-report") {
             } catch {
               const preview = rawBody.slice(0, 240).split(token).join("[redacted]");
               throw new Error(
-                "TikTok report GET /open_api/v2.0/report/integrated/get/ returned non-JSON (HTTP " +
+                "TikTok report " + requestMethod + " /open_api/v2.0/report/integrated/get/ returned non-JSON (HTTP " +
                 response.status + ", content-type " +
                 (response.headers.get("Content-Type") || "unknown") +
                 ", body " + JSON.stringify(preview) + ")"
@@ -794,7 +795,7 @@ if (url.pathname === "/api/tiktok/daily-report") {
             }
             if (!response.ok || result.code !== 0) {
               throw new Error(
-                "TikTok report GET /open_api/v2.0/report/integrated/get/ failed (HTTP " +
+                "TikTok report " + requestMethod + " /open_api/v2.0/report/integrated/get/ failed (HTTP " +
                 response.status + ", code " + (result.code ?? "unknown") +
                 ", message " + String(result.message || "unknown").slice(0, 200) + ")"
               );
