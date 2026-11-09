@@ -218,6 +218,8 @@ async function runScheduledSync(env) {
           if(typeof currency!=="string"||!currency.trim()||currency==="UNKNOWN")
             throw new Error(`Currency missing for advertiser ${advertiserId}; refusing to write ambiguous Spend`);
           const prior=pageAccum[advertiserId];
+          if(prior && prior.currency!==currency)
+            throw new Error(`Currency changed within report page for advertiser ${advertiserId}; refusing to combine currencies`);
           pageAccum[advertiserId]={
             spend:Math.round(((prior?.spend||0)+spend+Number.EPSILON)*100)/100,
             currency
@@ -225,6 +227,8 @@ async function runScheduledSync(env) {
         }
         for(const [advertiserId,row] of Object.entries(pageAccum)){
           const prior=state.spend_accum[advertiserId];
+          if(prior && prior.currency!==row.currency)
+            throw new Error(`Currency changed across report pages for advertiser ${advertiserId}; refusing to combine currencies`);
           state.spend_accum[advertiserId]={
             spend:Math.round(((prior?.spend||0)+row.spend+Number.EPSILON)*100)/100,
             currency:row.currency
