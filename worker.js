@@ -749,8 +749,7 @@ if (url.pathname === "/api/tiktok/daily-report") {
               end_date: reportDate,
               page,
               page_size: 1000,
-              // query_lifetime is listed as deprecated in the v2.0 migration notes;
-              // omit it and let the explicit start_date/end_date define the report.
+              query_lifetime: false,
               query_in_utc0: false
             };
             for (const [key, value] of Object.entries(reportParams)) {
@@ -802,6 +801,14 @@ if (url.pathname === "/api/tiktok/daily-report") {
             }
 
             const data = result.data;
+            // TikTok may truncate multi-advertiser results at its search limit.
+            // Never present a partial response as a complete daily total.
+            if (data?.extra_info?.search_ads_throttle) {
+              throw new Error(
+                "TikTok report was truncated by the search limit: " +
+                String(data.extra_info.search_ads_throttle).slice(0, 240)
+              );
+            }
             const info = data?.page_info;
             if (
               !Array.isArray(data?.list) ||
@@ -831,6 +838,12 @@ if (url.pathname === "/api/tiktok/daily-report") {
               const account = job.center.accountMap.get(advertiserId);
               if (!account || !ids.includes(advertiserId) || rowDate !== reportDate || !Number.isFinite(spend)) {
                 throw new Error("TikTok report row did not match the requested advertiser/date");
+              }
+              // For multi-advertiser reports TikTok adds currency to metrics;
+              // prefer that live value over potentially stale D1 account metadata.
+              const reportCurrency = item.metrics?.currency;
+              if (typeof reportCurrency === "string" && reportCurrency && reportCurrency !== "-") {
+                account.currency = reportCurrency;
               }
               account.spend = Math.round((account.spend + spend + Number.EPSILON) * 100) / 100;
             }
