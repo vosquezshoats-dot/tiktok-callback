@@ -988,6 +988,10 @@ if (url.pathname === "/api/tiktok/daily-report") {
               // prefer that live value over potentially stale D1 account metadata.
               const reportCurrency = item.metrics?.currency;
               if (typeof reportCurrency === "string" && reportCurrency && reportCurrency !== "-") {
+                if (account.report_currency && account.report_currency !== reportCurrency) {
+                  throw new Error(`Currency changed across live report pages for advertiser ${advertiserId}; refusing to combine currencies`);
+                }
+                account.report_currency = reportCurrency;
                 account.currency = reportCurrency;
               }
               account.spend = Math.round((account.spend + spend + Number.EPSILON) * 100) / 100;
