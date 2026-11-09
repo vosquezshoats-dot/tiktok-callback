@@ -259,7 +259,16 @@ async function runScheduledSync(env) {
     }
   } catch(error) {
     state.failed_pages++;state.last_error=String(error.message||"Sync failed").slice(0,500);
-    const retryMs=error.retryAfter?Math.max(60000,Number(error.retryAfter)*1000):Math.min(60*60*1000,SYNC_RETRY_BASE_MS*Math.pow(2,Math.min(state.failed_pages-1,4)));
+    const exponentialRetryMs=Math.min(60*60*1000,SYNC_RETRY_BASE_MS*Math.pow(2,Math.min(state.failed_pages-1,4)));
+    const retryAfterSeconds=Number(error.retryAfter);
+    const retryAfterDate=Date.parse(error.retryAfter||"");
+    const retryMs=error.retryAfter
+      ?Number.isFinite(retryAfterSeconds)&&retryAfterSeconds>=0
+        ?Math.max(60000,retryAfterSeconds*1000)
+        :Number.isFinite(retryAfterDate)
+          ?Math.max(60000,retryAfterDate-Date.now())
+          :exponentialRetryMs
+      :exponentialRetryMs;
     state.retry_at=new Date(Date.now()+retryMs).toISOString();state.running=true;state.lease_until=null;
     state.heartbeat_at=new Date().toISOString();
     if(expectedStateJson) await saveSyncState(env,state,expectedStateJson);
