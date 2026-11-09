@@ -95,7 +95,8 @@ async function fetchScheduledSpendPage(token, advertiserIds, reportDate, page) {
     page,
     page_size: 1000,
     query_lifetime: false,
-    query_in_utc0: false
+    // spend_date is calculated as the previous UTC calendar day.
+    query_in_utc0: true
   };
   const reportUrl = new URL("https://business-api.tiktok.com/open_api/v2.0/report/integrated/get/");
   for (const [key, value] of Object.entries(reportParams)) {
