@@ -211,8 +211,11 @@ async function runScheduledSync(env) {
           const spend=Number(item.metrics?.spend);
           if(!allowed.has(advertiserId)||rowDate!==state.spend_date||!Number.isFinite(spend))
             throw new Error("Scheduled Spend row did not match requested advertiser/date");
+          const fallbackCurrency=batch.find(a=>a.advertiser_id===advertiserId)?.currency;
           const currency=typeof item.metrics?.currency==="string"&&item.metrics.currency&&item.metrics.currency!=="-"
-            ?item.metrics.currency:(batch.find(a=>a.advertiser_id===advertiserId)?.currency||"UNKNOWN");
+            ?item.metrics.currency:fallbackCurrency;
+          if(typeof currency!=="string"||!currency.trim()||currency==="UNKNOWN")
+            throw new Error(`Currency missing for advertiser ${advertiserId}; refusing to write ambiguous Spend`);
           const prior=pageAccum[advertiserId];
           pageAccum[advertiserId]={
             spend:Math.round(((prior?.spend||0)+spend+Number.EPSILON)*100)/100,
@@ -231,13 +234,17 @@ async function runScheduledSync(env) {
           state.spend_page++;await persist();continue;
         }
         const timestamp=new Date().toISOString();
-        for(const account of batch){
+        const rowsToWrite=batch.map(account=>{
           const report=state.spend_accum[account.advertiser_id];
-          const currency=report?.currency||account.currency||"UNKNOWN";
-          const spend=String(report?.spend??0);
+          const currency=report?.currency||account.currency;
+          if(typeof currency!=="string"||!currency.trim()||currency==="UNKNOWN")
+            throw new Error(`Currency missing for advertiser ${account.advertiser_id}; refusing to write ambiguous Spend`);
+          return {account,currency,spend:String(report?.spend??0)};
+        });
+        for(const row of rowsToWrite){
           await env.DB.prepare(
             "INSERT INTO daily_spend (business_center_id,advertiser_id,report_date,currency,spend,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(business_center_id,advertiser_id,report_date,currency) DO UPDATE SET spend=excluded.spend,updated_at=excluded.updated_at"
-          ).bind(bc,account.advertiser_id,state.spend_date,currency,spend,timestamp).run();
+          ).bind(bc,row.account.advertiser_id,state.spend_date,row.currency,row.spend,timestamp).run();
           state.spend_rows_written++;
         }
         state.spend_batch_index++;state.spend_page=1;state.spend_total_pages=null;state.spend_accum={};
@@ -988,6 +995,13 @@ if (url.pathname === "/api/tiktok/daily-report") {
 
         // Save the verified live report into historical D1 storage. The
         // composite primary key makes repeated reads safe and idempotent.
+        for (const center of centers.values()) {
+          for (const account of center.accounts) {
+            if(typeof account.currency!=="string"||!account.currency.trim()||account.currency==="UNKNOWN") {
+              throw new Error(`Currency missing for advertiser ${account.advertiser_id}; refusing to persist ambiguous Spend`);
+            }
+          }
+        }
         const persistedAt = new Date().toISOString();
         for (const center of centers.values()) {
           for (const account of center.accounts) {
