@@ -68,7 +68,7 @@ function newSyncState(previous, now) {
     completed_at:previous?.completed_at??null,heartbeat_at:new Date(now).toISOString(),lease_until:null,
     bc_page:1,bc_ids:[],bc_total_pages:null,bc_index:0,account_page:1,account_total_pages:null,
     pending_assets:null,batch_index:0,processed_bcs:0,processed_accounts:0,new_accounts:0,updated_accounts:0,
-    failed_pages:0,last_error:null,retry_at:null};
+    failed_pages:0,last_error:null,retry_at:null,spend_date:null,spend_bc_index:0,spend_batch_index:0,spend_page:1,spend_total_pages:null,spend_accum:{},spend_rows_written:0};
 }
 async function acquireSyncLease(env) {
   const row=await loadSyncRow(env); const now=Date.now(); let state=null;
@@ -84,6 +84,64 @@ async function acquireSyncLease(env) {
   const saved=ok?await loadSyncRow(env):null;
   return ok?{state,expectedStateJson:saved?.state_json}:null;
 }
+
+async function fetchScheduledSpendPage(token, advertiserIds, reportDate, page) {
+  const reportParams = {
+    advertiser_ids: advertiserIds,
+    dimensions: ["advertiser_id", "stat_time_day"],
+    metrics: ["spend"],
+    start_date: reportDate,
+    end_date: reportDate,
+    page,
+    page_size: 1000,
+    query_lifetime: false,
+    query_in_utc0: false
+  };
+  const reportUrl = new URL("https://business-api.tiktok.com/open_api/v2.0/report/integrated/get/");
+  for (const [key, value] of Object.entries(reportParams)) {
+    reportUrl.searchParams.set(key, Array.isArray(value) ? JSON.stringify(value) : String(value));
+  }
+  let method = "GET";
+  let response = await fetch(reportUrl.toString(), {
+    method,
+    headers: { "Access-Token": token },
+    signal: AbortSignal.timeout(15000)
+  });
+  let attempts = 1;
+  if (response.status === 405) {
+    method = "POST";
+    attempts++;
+    response = await fetch("https://business-api.tiktok.com/open_api/v2.0/report/integrated/get/", {
+      method,
+      headers: { "Access-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify(reportParams),
+      signal: AbortSignal.timeout(15000)
+    });
+  }
+  const raw = await response.text();
+  let result;
+  try { result = JSON.parse(raw); }
+  catch { throw new Error("TikTok scheduled Spend report returned non-JSON (HTTP " + response.status + ")"); }
+  if (!response.ok || result.code !== 0) {
+    const error = new Error("TikTok scheduled Spend report failed (HTTP " + response.status +
+      ", code " + (result.code ?? "unknown") + ", message " + String(result.message || "unknown").slice(0, 200) + ")");
+    error.retryAfter = response.headers.get("Retry-After");
+    throw error;
+  }
+  const data = result.data;
+  if (data?.extra_info?.search_ads_throttle) {
+    throw new Error("TikTok scheduled Spend report was truncated by the search limit: " +
+      String(data.extra_info.search_ads_throttle).slice(0, 200));
+  }
+  const info = data?.page_info;
+  if (!Array.isArray(data?.list) || !info ||
+      !Number.isInteger(Number(info.page)) || Number(info.page) !== page ||
+      !Number.isInteger(Number(info.total_page)) || Number(info.total_page) < 0) {
+    throw new Error("TikTok scheduled Spend report returned invalid page data");
+  }
+  return { rows: data.list, totalPages: Number(info.total_page), attempts };
+}
+
 async function runScheduledSync(env) {
   let lease=await acquireSyncLease(env); if(!lease) return;
   let {state,expectedStateJson}=lease;
@@ -104,7 +162,7 @@ async function runScheduledSync(env) {
           if(!state.bc_ids.includes(id))state.bc_ids.push(id);}
         state.bc_total_pages=pi.total;if(pi.page<pi.total)state.bc_page++;else{state.phase="accounts";state.bc_index=0;}pages++;
       } else if(state.phase==="accounts") {
-        if(state.bc_index>=state.bc_ids.length){state.running=false;state.phase="complete";state.completed_at=new Date().toISOString();state.cycle_due_at=new Date(Date.now()+SYNC_INTERVAL_MS).toISOString();state.lease_until=null;state.retry_at=null;await persist();return;}
+        if(state.bc_index>=state.bc_ids.length){state.phase="spend";state.spend_date=new Date(Date.now()-86400000).toISOString().slice(0,10);state.spend_bc_index=0;state.spend_batch_index=0;state.spend_page=1;state.spend_total_pages=null;state.spend_accum={};await persist();continue;}
         const bc=state.bc_ids[state.bc_index];state.current_bc=bc;state.current_page=state.account_page;
         if(!state.pending_assets){const u=new URL("https://business-api.tiktok.com/open_api/v1.3/bc/asset/get/");u.searchParams.set("bc_id",bc);u.searchParams.set("asset_type","ADVERTISER");u.searchParams.set("page",String(state.account_page));u.searchParams.set("page_size","50");
           const r=await tiktokGet(u,token);requests++;if(!Array.isArray(r.data?.list))throw new Error("Advertiser asset list missing; cursor retained");const pi=pageInfo(r.data);state.pending_assets=r.data.list;state.account_total_pages=pi.total;state.batch_index=0;pages++;await persist();}
@@ -121,6 +179,60 @@ async function runScheduledSync(env) {
         }
         state.pending_assets=null;state.batch_index=0;
         if(state.account_page<state.account_total_pages)state.account_page++;else{state.bc_index++;state.processed_bcs++;state.account_page=1;state.account_total_pages=null;}pages++;
+
+      } else if(state.phase==="spend") {
+        if(state.spend_bc_index>=state.bc_ids.length){
+          state.running=false;state.phase="complete";state.completed_at=new Date().toISOString();
+          state.cycle_due_at=new Date(Date.now()+SYNC_INTERVAL_MS).toISOString();state.lease_until=null;state.retry_at=null;
+          await persist();return;
+        }
+        const bc=state.bc_ids[state.spend_bc_index];
+        const accountResult=await env.DB.prepare(
+          "SELECT advertiser_id, currency FROM advertiser_accounts WHERE business_center_id=? ORDER BY advertiser_id"
+        ).bind(bc).all();
+        const accounts=(accountResult.results||[]).map(row=>({
+          advertiser_id:String(row.advertiser_id),currency:String(row.currency||"UNKNOWN")
+        }));
+        const batches=[];for(let i=0;i<accounts.length;i+=20)batches.push(accounts.slice(i,i+20));
+        if(state.spend_batch_index>=batches.length){
+          state.spend_bc_index++;state.spend_batch_index=0;state.spend_page=1;state.spend_total_pages=null;state.spend_accum={};
+          await persist();continue;
+        }
+        const batch=batches[state.spend_batch_index];
+        if(requests>=SYNC_MAX_EXTERNAL_REQUESTS || pages>=SYNC_MAX_PAGES) break;
+        const pageResult=await fetchScheduledSpendPage(token,batch.map(a=>a.advertiser_id),state.spend_date,state.spend_page);
+        requests+=pageResult.attempts;pages++;
+        const allowed=new Set(batch.map(a=>a.advertiser_id));
+        for(const item of pageResult.rows){
+          const advertiserId=String(item.dimensions?.advertiser_id||"");
+          const rowDate=item.dimensions?.stat_time_day;
+          const spend=Number(item.metrics?.spend);
+          if(!allowed.has(advertiserId)||rowDate!==state.spend_date||!Number.isFinite(spend))
+            throw new Error("Scheduled Spend row did not match requested advertiser/date");
+          const currency=typeof item.metrics?.currency==="string"&&item.metrics.currency&&item.metrics.currency!=="-"
+            ?item.metrics.currency:(batch.find(a=>a.advertiser_id===advertiserId)?.currency||"UNKNOWN");
+          const prior=state.spend_accum[advertiserId];
+          state.spend_accum[advertiserId]={
+            spend:Math.round(((prior?.spend||0)+spend+Number.EPSILON)*100)/100,
+            currency
+          };
+        }
+        state.spend_total_pages=pageResult.totalPages;
+        if(state.spend_page<state.spend_total_pages){
+          state.spend_page++;await persist();continue;
+        }
+        const timestamp=new Date().toISOString();
+        for(const account of batch){
+          const report=state.spend_accum[account.advertiser_id];
+          const currency=report?.currency||account.currency||"UNKNOWN";
+          const spend=String(report?.spend??0);
+          await env.DB.prepare(
+            "INSERT INTO daily_spend (business_center_id,advertiser_id,report_date,currency,spend,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(business_center_id,advertiser_id,report_date,currency) DO UPDATE SET spend=excluded.spend,updated_at=excluded.updated_at"
+          ).bind(bc,account.advertiser_id,state.spend_date,currency,spend,timestamp).run();
+          state.spend_rows_written++;
+        }
+        state.spend_batch_index++;state.spend_page=1;state.spend_total_pages=null;state.spend_accum={};
+        await persist();
       } else throw new Error(`Unknown sync phase: ${state.phase}`);
       await persist();
     }
@@ -863,6 +975,17 @@ if (url.pathname === "/api/tiktok/daily-report") {
         });
         await Promise.all(workers);
         if (requestFailure) throw requestFailure;
+
+        // Save the verified live report into historical D1 storage. The
+        // composite primary key makes repeated reads safe and idempotent.
+        const persistedAt = new Date().toISOString();
+        for (const center of centers.values()) {
+          for (const account of center.accounts) {
+            await env.DB.prepare(
+              "INSERT INTO daily_spend (business_center_id,advertiser_id,report_date,currency,spend,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(business_center_id,advertiser_id,report_date,currency) DO UPDATE SET spend=excluded.spend,updated_at=excluded.updated_at"
+            ).bind(center.business_center_id,account.advertiser_id,reportDate,account.currency,String(account.spend),persistedAt).run();
+          }
+        }
 
         const businessCenters = [...centers.values()].map(center => {
           const currencyTotals = {};
