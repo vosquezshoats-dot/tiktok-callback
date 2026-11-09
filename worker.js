@@ -203,6 +203,7 @@ async function runScheduledSync(env) {
         const pageResult=await fetchScheduledSpendPage(token,batch.map(a=>a.advertiser_id),state.spend_date,state.spend_page);
         requests+=pageResult.attempts;pages++;
         const allowed=new Set(batch.map(a=>a.advertiser_id));
+        const pageAccum={};
         for(const item of pageResult.rows){
           const advertiserId=String(item.dimensions?.advertiser_id||"");
           const rowDate=item.dimensions?.stat_time_day;
@@ -211,10 +212,17 @@ async function runScheduledSync(env) {
             throw new Error("Scheduled Spend row did not match requested advertiser/date");
           const currency=typeof item.metrics?.currency==="string"&&item.metrics.currency&&item.metrics.currency!=="-"
             ?item.metrics.currency:(batch.find(a=>a.advertiser_id===advertiserId)?.currency||"UNKNOWN");
-          const prior=state.spend_accum[advertiserId];
-          state.spend_accum[advertiserId]={
+          const prior=pageAccum[advertiserId];
+          pageAccum[advertiserId]={
             spend:Math.round(((prior?.spend||0)+spend+Number.EPSILON)*100)/100,
             currency
+          };
+        }
+        for(const [advertiserId,row] of Object.entries(pageAccum)){
+          const prior=state.spend_accum[advertiserId];
+          state.spend_accum[advertiserId]={
+            spend:Math.round(((prior?.spend||0)+row.spend+Number.EPSILON)*100)/100,
+            currency:row.currency
           };
         }
         state.spend_total_pages=pageResult.totalPages;
