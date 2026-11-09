@@ -735,28 +735,25 @@ if (url.pathname === "/api/tiktok/daily-report") {
           let page = 1;
           let totalPages = 1;
           do {
-            const response = await fetch(
-              "https://business-api.tiktok.com/open_api/v2.0/report/integrated/get/",
-              {
-                method: "POST",
-                headers: {
-                  "Access-Token": token,
-                  "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                  advertiser_ids: ids,
-                  dimensions: ["advertiser_id", "stat_time_day"],
-                  metrics: ["spend"],
-                  start_date: reportDate,
-                  end_date: reportDate,
-                  page,
-                  page_size: 1000,
-                  query_lifetime: false,
-                  query_in_utc0: false
-                }),
-                signal: AbortSignal.timeout(15000)
-              }
+            // Synchronous integrated reports use GET in the v2.0 migration.
+            // POST is reserved for /report/task/create/ (asynchronous reports).
+            const reportUrl = new URL(
+              "https://business-api.tiktok.com/open_api/v2.0/report/integrated/get/"
             );
+            reportUrl.searchParams.set("advertiser_ids", JSON.stringify(ids));
+            reportUrl.searchParams.set("dimensions", JSON.stringify(["advertiser_id", "stat_time_day"]));
+            reportUrl.searchParams.set("metrics", JSON.stringify(["spend"]));
+            reportUrl.searchParams.set("start_date", reportDate);
+            reportUrl.searchParams.set("end_date", reportDate);
+            reportUrl.searchParams.set("page", String(page));
+            reportUrl.searchParams.set("page_size", "1000");
+            reportUrl.searchParams.set("query_lifetime", "false");
+            reportUrl.searchParams.set("query_in_utc0", "false");
+            const response = await fetch(reportUrl.toString(), {
+              method: "GET",
+              headers: { "Access-Token": token },
+              signal: AbortSignal.timeout(15000)
+            });
             const rawBody = await response.text();
             let result;
             try {
@@ -764,7 +761,7 @@ if (url.pathname === "/api/tiktok/daily-report") {
             } catch {
               const preview = rawBody.slice(0, 240).split(token).join("[redacted]");
               throw new Error(
-                "TikTok report POST /open_api/v2.0/report/integrated/get/ returned non-JSON (HTTP " +
+                "TikTok report GET /open_api/v2.0/report/integrated/get/ returned non-JSON (HTTP " +
                 response.status + ", content-type " +
                 (response.headers.get("Content-Type") || "unknown") +
                 ", body " + JSON.stringify(preview) + ")"
@@ -772,7 +769,7 @@ if (url.pathname === "/api/tiktok/daily-report") {
             }
             if (!response.ok || result.code !== 0) {
               throw new Error(
-                "TikTok report POST /open_api/v2.0/report/integrated/get/ failed (HTTP " +
+                "TikTok report GET /open_api/v2.0/report/integrated/get/ failed (HTTP " +
                 response.status + ", code " + (result.code ?? "unknown") +
                 ", message " + String(result.message || "unknown").slice(0, 200) + ")"
               );
