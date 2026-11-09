@@ -185,6 +185,8 @@ async function runScheduledSync(env) {
         if(state.spend_bc_index>=state.bc_ids.length){
           state.running=false;state.phase="complete";state.completed_at=new Date().toISOString();
           state.cycle_due_at=new Date(Date.now()+SYNC_INTERVAL_MS).toISOString();state.lease_until=null;state.retry_at=null;
+          // A completed retry has recovered; do not expose an obsolete failure as the current error.
+          state.last_error=null;
           await persist();return;
         }
         const bc=state.bc_ids[state.spend_bc_index];
